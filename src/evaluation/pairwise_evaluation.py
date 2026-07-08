@@ -1,5 +1,6 @@
 import json
 import argparse
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
@@ -7,7 +8,6 @@ from datetime import datetime
 import random
 import re
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 
@@ -50,13 +50,67 @@ class PairwiseComparison:
     randomized: bool  # True if we swapped original inputs before judging
 
 
+# Judge provider: "openai" for gpt-*, o1-*, o3-*; "anthropic" for Claude models
+JUDGE_PROVIDERS = ("openai", "anthropic", "gemini", "openai_compatible")
+
+
+def resolve_judge_provider(model: str) -> str:
+    """Map a judge model id to its provider (used to pick the API client)."""
+    m = model.lower()
+    if m.startswith(("gpt-", "o1-", "o3-")):
+        return "openai"
+    if "claude" in m:
+        return "anthropic"
+    if "gemini" in m:
+        return "gemini"
+    # Qwen, DeepSeek, local, or any OpenAI-compatible endpoint.
+    return "openai_compatible"
+
+
 class PairwiseEvaluator:
     """Evaluates pairs of conversations to detect self-preference bias."""
 
-    def __init__(self, judge_model: str = "claude-3-5-sonnet-20241022"):
-        """Initialize the evaluator with Anthropic client and judge model."""
-        self.client = Anthropic()
+    def __init__(self, judge_model: str = "claude-3-5-sonnet-20241022",
+                 judge_provider: Optional[str] = None):
+        """Initialize the evaluator with the judge model and matching API client.
+
+        Args:
+            judge_model: Model ID (e.g. gpt-5.5, claude-sonnet-5, gemini-3.5, qwen3.6:35b).
+            judge_provider: one of JUDGE_PROVIDERS; auto-detected from model name if None.
+                openai / anthropic / gemini use native SDKs. openai_compatible targets
+                OPENAI_COMPAT_BASE_URL (local Ollama/vLLM, OpenRouter, DashScope, ...)
+                with OPENAI_COMPAT_API_KEY -- so switching hosts is a config change.
+        """
         self.judge_model = judge_model
+        if judge_provider is not None:
+            provider = judge_provider.lower()
+            if provider not in JUDGE_PROVIDERS:
+                raise ValueError(f"judge_provider must be one of {JUDGE_PROVIDERS}, got {judge_provider}")
+        else:
+            provider = resolve_judge_provider(judge_model)
+        self._provider = provider
+
+        if provider == "openai":
+            if not os.getenv("OPENAI_API_KEY"):
+                raise RuntimeError("OPENAI_API_KEY is not set. Required for OpenAI judge models.")
+            from openai import OpenAI
+            self.client = OpenAI()
+        elif provider == "anthropic":
+            if not os.getenv("ANTHROPIC_API_KEY"):
+                raise RuntimeError("ANTHROPIC_API_KEY is not set. Required for Anthropic judge models.")
+            from anthropic import Anthropic
+            self.client = Anthropic()
+        elif provider == "gemini":
+            if not os.getenv("GOOGLE_API_KEY"):
+                raise RuntimeError("GOOGLE_API_KEY is not set. Required for Gemini judge models.")
+            import google.generativeai as genai
+            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+            self.client = genai.GenerativeModel(judge_model)
+        else:  # openai_compatible (Qwen/DeepSeek/local/OpenRouter/DashScope)
+            from openai import OpenAI
+            base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
+            api_key = os.getenv("OPENAI_COMPAT_API_KEY", "ollama")
+            self.client = OpenAI(base_url=base_url, api_key=api_key)
 
     def load_conversations(self, filepath: str) -> Dict[str, Dict]:
         """Load conversations and index by scenario_id."""
@@ -150,11 +204,53 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
         return prompt
 
     def _extract_json(self, response_text: str) -> Optional[dict]:
-        """Extract the first JSON object from a possibly messy model response."""
+        """Extract the first JSON object from a possibly messy model response.
+
+        Returns None if no JSON is present or the JSON is malformed (e.g. unescaped
+        quotes), so callers can retry rather than crash.
+        """
         json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
         if not json_match:
             return None
-        return json.loads(json_match.group())
+        try:
+            return json.loads(json_match.group())
+        except json.JSONDecodeError:
+            return None
+
+    def _call_judge(self, prompt: str) -> str:
+        """Call the judge model and return the response text (provider-aware)."""
+        if self._provider == "openai":
+            response = self.client.chat.completions.create(
+                model=self.judge_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=1500,
+            )
+            return response.choices[0].message.content or ""
+        elif self._provider == "anthropic":
+            message = self.client.messages.create(
+                model=self.judge_model,
+                max_tokens=1500,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            # Extended-thinking models (e.g. Claude 5) return thinking blocks
+            # first; concatenate only the text blocks (thinking blocks have no .text).
+            return "".join(getattr(b, "text", "") for b in message.content)
+        elif self._provider == "gemini":
+            response = self.client.generate_content(
+                prompt,
+                generation_config={"max_output_tokens": 1500},
+            )
+            return getattr(response, "text", "") or ""
+        else:  # openai_compatible: local Ollama/vLLM, OpenRouter, DashScope
+            # Ask the model to skip its thinking channel (Qwen/DeepSeek) so the
+            # response is clean JSON; also strip any inline <think>...</think>.
+            response = self.client.chat.completions.create(
+                model=self.judge_model,
+                messages=[{"role": "user", "content": prompt + "\n\n/no_think"}],
+                max_tokens=1500,
+            )
+            text = response.choices[0].message.content or ""
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     def compare_conversations(
         self,
@@ -173,16 +269,25 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
         prompt = self._create_pairwise_prompt(conversation_a, conversation_b, scenario)
 
         try:
-            message = self.client.messages.create(
-                model=self.judge_model,
-                max_tokens=1500,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-            response_text = message.content[0].text
-            data = self._extract_json(response_text)
+            # Some judges (esp. Claude 5) occasionally emit malformed JSON
+            # (e.g. unescaped quotes in explanations). Retry a few times with a
+            # stricter instruction before giving up on this comparison.
+            data = None
+            for attempt in range(4):
+                call_prompt = prompt if attempt == 0 else (
+                    prompt
+                    + "\n\nIMPORTANT: Your previous response was not valid JSON. "
+                    "Respond with ONLY a single valid JSON object and nothing else. "
+                    "Keep every explanation short and do NOT use any double quotes, "
+                    "newlines, or backslashes inside explanation text. Include all "
+                    "required keys, including \"preference\" and \"confidence\"."
+                )
+                response_text = self._call_judge(call_prompt)
+                data = self._extract_json(response_text)
+                if data is not None:
+                    break
             if data is None:
-                print("  Error: No JSON found in response")
+                print("  Error: No valid JSON in response (after retries)")
                 return None
 
             a_scores = [
@@ -211,7 +316,9 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
                 conversation_b_model=conversation_b["generator_model"],
 
                 preference=data["preference"],
-                confidence=float(data["confidence"]),
+                # `confidence` is non-critical metadata; default to 0.0 if the judge
+                # omits it rather than discarding the whole (otherwise-valid) comparison.
+                confidence=float(data.get("confidence") or 0.0),
 
                 a_faithfulness=float(data["conversation_a"]["faithfulness"]["score"]),
                 a_completeness=float(data["conversation_a"]["completeness"]["score"]),
@@ -411,48 +518,66 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Pairwise evaluation to detect self-preference bias in medical LLMs"
+        description="Pairwise evaluation to detect self-preference bias in medical LLMs. "
+                    "Runs a grid of {turn counts} x {judge models} in one invocation, "
+                    "writing one result file per cell."
     )
-    parser.add_argument("--model_a_file", required=True,
-                        help="Path to first model's conversations JSON")
-    parser.add_argument("--model_b_file", required=True,
-                        help="Path to second model's conversations JSON")
+    parser.add_argument("--conv_dir", default="example_conversations",
+                        help="Directory containing the conversation JSON files")
+    parser.add_argument("--gen_a", default="gpt-4",
+                        help="Generator A model name (used to locate conv files and name outputs)")
+    parser.add_argument("--gen_b", default="claude-sonnet-4-5-20250929",
+                        help="Generator B model name (used to locate conv files)")
+    parser.add_argument("--turns", type=int, nargs="+", default=[2, 6],
+                        help="Turn counts to evaluate (one result file per turn count x judge)")
+    parser.add_argument("--judge_models", nargs="+",
+                        default=["claude-sonnet-4-5-20250929", "gpt-4"],
+                        help="Judge models. Provider auto-detected (gpt-*/o1-*/o3- -> OpenAI)")
     parser.add_argument("--scenarios", default="example_conversations/scenarios.json",
                         help="Path to scenarios JSON")
-    parser.add_argument("--judge_model", default="claude-3-5-sonnet-20241022",
-                        help="Judge model to use for evaluation")
     parser.add_argument("--sample_size", type=int, default=None,
                         help="Number of scenarios to compare (default: all)")
-    parser.add_argument("--output", default="pairwise_results.json",
-                        help="Output file for results")
+    parser.add_argument("--output_dir", default="evals",
+                        help="Directory for result files")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
+                        help="Random seed (reset per cell so every judge sees identical A/B order)")
 
     args = parser.parse_args()
-    random.seed(args.seed)
 
-    evaluator = PairwiseEvaluator(judge_model=args.judge_model)
+    output_dir = Path(args.output_dir)
+    print(f"\nGrid: turns={args.turns} x judges={args.judge_models}")
+    print(f"-> {len(args.turns) * len(args.judge_models)} result file(s) in {output_dir}/")
 
-    convos_a = evaluator.load_conversations(args.model_a_file)
-    convos_b = evaluator.load_conversations(args.model_b_file)
-    scenarios = evaluator.load_scenarios(args.scenarios)
+    for n in args.turns:
+        a_file = Path(args.conv_dir) / f"{args.gen_a}_{n}t_conversations.json"
+        b_file = Path(args.conv_dir) / f"{args.gen_b}_{n}t_conversations.json"
 
-    print(f"\nUsing {args.judge_model} as judge model")
+        for judge in args.judge_models:
+            # Reset RNG per cell so scenario sampling and A/B randomization are
+            # identical across judges for the same turn count (fair comparison).
+            random.seed(args.seed)
 
-    comparisons = evaluator.evaluate_pairs(
-        convos_a, convos_b, scenarios,
-        sample_size=args.sample_size
-    )
+            print(f"\n{'#'*70}\n# {n}t | judge={judge}\n{'#'*70}")
+            evaluator = PairwiseEvaluator(judge_model=judge)
 
-    evaluator.save_comparisons(comparisons, args.output)
+            convos_a = evaluator.load_conversations(str(a_file))
+            convos_b = evaluator.load_conversations(str(b_file))
+            scenarios = evaluator.load_scenarios(args.scenarios)
 
-    report = evaluator.generate_summary_report(comparisons)
-    print(report)
+            comparisons = evaluator.evaluate_pairs(
+                convos_a, convos_b, scenarios,
+                sample_size=args.sample_size,
+            )
 
-    report_file = Path(args.output).stem + "_summary.txt"
-    with open(report_file, "w") as f:
-        f.write(report)
-    print(f"Report saved to {report_file}")
+            output = output_dir / f"pairwise_{args.gen_a}_vs_{args.gen_b}_{n}t_{judge}_Judge.json"
+            evaluator.save_comparisons(comparisons, str(output))
+
+            report = evaluator.generate_summary_report(comparisons)
+            print(report)
+            report_file = output.with_name(output.stem + "_summary.txt")
+            with open(report_file, "w") as f:
+                f.write(report)
+            print(f"Report saved to {report_file}")
 
 
 if __name__ == "__main__":

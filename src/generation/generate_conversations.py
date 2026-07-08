@@ -212,6 +212,18 @@ class LLMClient:
         raise NotImplementedError
 
 
+def _model_supports_temperature(model_name: str) -> bool:
+    """Some newer models (GPT-5.x, OpenAI o-series, Claude 5 family) only allow the
+    default temperature and reject an explicit `temperature` argument. Return False
+    for those so callers can omit the parameter."""
+    m = model_name.lower()
+    if m.startswith(("gpt-5", "o1", "o3")):
+        return False
+    if re.search(r"claude-(sonnet|opus|haiku|fable)-5", m):
+        return False
+    return True
+
+
 class OpenAIClient(LLMClient):
     """OpenAI API client."""
     
@@ -231,15 +243,17 @@ class OpenAIClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int = 500,
     ) -> str:
-        response = await self.client.chat.completions.create(
+        kwargs = dict(
             model=self.model_name,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=temperature,
-            max_tokens=max_tokens
+            max_completion_tokens=max_tokens,
         )
+        if _model_supports_temperature(self.model_name):
+            kwargs["temperature"] = temperature
+        response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
 
@@ -262,16 +276,20 @@ class AnthropicClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int = 500,
     ) -> str:
-        response = await self.client.messages.create(
+        kwargs = dict(
             model=self.model_name,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=temperature
         )
-        return response.content[0].text
+        if _model_supports_temperature(self.model_name):
+            kwargs["temperature"] = temperature
+        response = await self.client.messages.create(**kwargs)
+        # Extended-thinking models (e.g. Claude 5) return thinking blocks first;
+        # concatenate only the text blocks (thinking blocks have no .text).
+        return "".join(getattr(b, "text", "") for b in response.content)
 
 
 class GeminiClient(LLMClient):
@@ -304,18 +322,61 @@ class GeminiClient(LLMClient):
         return response.text
 
 
+class OpenAICompatibleClient(LLMClient):
+    """Client for any OpenAI-compatible endpoint: local (Ollama/vLLM) or hosted
+    (OpenRouter/DashScope). Endpoint + key come from env so switching hosts is a
+    config change, not a code change:
+
+        OPENAI_COMPAT_BASE_URL  (default http://localhost:11434/v1  -> local Ollama)
+        OPENAI_COMPAT_API_KEY   (default "ollama"; a dummy is fine for local)
+
+    Used for models that aren't native OpenAI/Anthropic/Gemini (e.g. Qwen, DeepSeek).
+    """
+
+    def __init__(self, model_name: str):
+        super().__init__(model_name)
+        from openai import AsyncOpenAI
+        base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
+        api_key = os.getenv("OPENAI_COMPAT_API_KEY", "ollama")
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.7,
+        max_tokens: int = 500,
+    ) -> str:
+        # Local servers (Ollama/vLLM) use classic `max_tokens`, not `max_completion_tokens`.
+        kwargs = dict(
+            model=self.model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=max_tokens,
+        )
+        if _model_supports_temperature(self.model_name):
+            kwargs["temperature"] = temperature
+        response = await self.client.chat.completions.create(**kwargs)
+        text = response.choices[0].message.content or ""
+        # Strip any <think>...</think> reasoning some models (e.g. Qwen) emit inline.
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
 def get_client(model_name: str) -> LLMClient:
-    """Factory function to get appropriate client."""
+    """Factory: route a model id to the right client (native or OpenAI-compatible)."""
     model_lower = model_name.lower()
-    
-    if "gpt" in model_lower:
+
+    if model_lower.startswith(("gpt-", "o1-", "o3-")):
         return OpenAIClient(model_name)
     elif "claude" in model_lower:
         return AnthropicClient(model_name)
     elif "gemini" in model_lower:
         return GeminiClient(model_name)
     else:
-        raise ValueError(f"Unknown model: {model_name}")
+        # Qwen, DeepSeek, local, or any OpenAI-compatible endpoint.
+        return OpenAICompatibleClient(model_name)
 
 
 

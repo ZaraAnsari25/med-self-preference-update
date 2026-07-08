@@ -6,3 +6,12 @@ visualizer/.next/
 HealthCareMagic-100k.json
 iCliniq.json
 *.DS_Store
+
+# python caches
+__pycache__/
+*.pyc
+
+# multi-turn run outputs (regenerable; keep the .sh scripts, ignore data + logs)
+multi_turn_zara_run/Generation/
+multi_turn_zara_run/Evaluation/
+multi_turn_zara_run/*.log
