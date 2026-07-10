@@ -10,6 +10,9 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 import hashlib
 import re
+import time
+import urllib.request
+import urllib.error
 
 import yaml
 from dotenv import load_dotenv
@@ -19,6 +22,30 @@ from tqdm import tqdm
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+def _http_post_json(url: str, payload: dict, timeout: int = 120, retries: int = 5) -> dict:
+    """POST JSON and return the parsed response, retrying with exponential backoff on
+    transient errors (HTTP 429/500/502/503/504, network timeouts). Used for the raw
+    HTTP endpoints (Gemini REST, Ollama native) which — unlike the OpenAI/Anthropic
+    SDKs — have no built-in retry, so a transient blip would otherwise drop a turn."""
+    data = json.dumps(payload).encode()
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code in (429, 500, 502, 503, 504):
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_exc = e
+            time.sleep(min(2 ** attempt, 30))
+    raise last_exc
 
 @dataclass
 class MedicalScenario:
@@ -253,6 +280,16 @@ class OpenAIClient(LLMClient):
         )
         if _model_supports_temperature(self.model_name):
             kwargs["temperature"] = temperature
+        # Reasoning models (GPT-5.x, o-series) spend part of max_completion_tokens on
+        # hidden reasoning. We turn it OFF (reasoning_effort="none") for consistency with
+        # the other models (all thinking disabled) and speed. Valid: none/low/medium/high/
+        # xhigh; override via OPENAI_REASONING_EFFORT, or set it empty to omit the param
+        # (e.g. for non-reasoning models like gpt-4o that reject it).
+        m = self.model_name.lower()
+        if m.startswith(("gpt-5", "o1", "o3", "o4")):
+            effort = os.getenv("OPENAI_REASONING_EFFORT", "none")
+            if effort:
+                kwargs["reasoning_effort"] = effort
         response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
@@ -293,19 +330,42 @@ class AnthropicClient(LLMClient):
 
 
 class GeminiClient(LLMClient):
-    """Google Gemini API client."""
-    
+    """Google Gemini client (REST).
+
+    Uses the REST API directly rather than the google-generativeai SDK because Gemini
+    3.x flash "thinks" by default and the old SDK cannot disable it (no thinking_config
+    field). We call generateContent with thinkingConfig.thinkingBudget=0 so thinking is
+    OFF -- consistent with the other models and ~3x faster.
+    """
+
     def __init__(self, model_name: str = "gemini-pro"):
         super().__init__(model_name)
-        import google.generativeai as genai
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "GOOGLE_API_KEY is not set. Please export GOOGLE_API_KEY before running generation."
             )
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
-    
+        self.api_key = api_key
+        self.url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}"
+            f":generateContent?key={api_key}"
+        )
+
+    def _rest(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
+        full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
+        gen_cfg = {
+            "temperature": temperature,
+            "maxOutputTokens": max_tokens,
+            "thinkingConfig": {"thinkingBudget": 0},  # thinking OFF
+        }
+        payload = {
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": gen_cfg,
+        }
+        data = _http_post_json(self.url, payload, timeout=120)
+        cand = (data.get("candidates") or [{}])[0]
+        return "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+
     async def generate(
         self,
         system_prompt: str,
@@ -313,13 +373,7 @@ class GeminiClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int = 500,
     ) -> str:
-        full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
-        response = await asyncio.to_thread(
-            self.model.generate_content,
-            full_prompt,
-            generation_config={"temperature": temperature, "max_output_tokens": max_tokens}
-        )
-        return response.text
+        return await asyncio.to_thread(self._rest, system_prompt, user_prompt, temperature, max_tokens)
 
 
 class OpenAICompatibleClient(LLMClient):
@@ -336,9 +390,36 @@ class OpenAICompatibleClient(LLMClient):
     def __init__(self, model_name: str):
         super().__init__(model_name)
         from openai import AsyncOpenAI
-        base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
-        api_key = os.getenv("OPENAI_COMPAT_API_KEY", "ollama")
-        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self.base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
+        self.api_key = os.getenv("OPENAI_COMPAT_API_KEY", "ollama")
+        self.client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        # Ollama detection: for thinking models (Qwen3/DeepSeek) the OpenAI-compat
+        # endpoint IGNORES `think`/`/no_think` and returns EMPTY content (all budget
+        # goes to the hidden reasoning channel). Only Ollama's native /api/chat with
+        # "think": false actually disables it. Verified empirically on qwen3.6:35b.
+        self._is_ollama = ("11434" in self.base_url) or (self.api_key.lower() == "ollama")
+        native = self.base_url.rstrip("/")
+        if native.endswith("/v1"):
+            native = native[:-3]
+        self._native_chat_url = native.rstrip("/") + "/api/chat"
+
+    def _ollama_native(self, system_prompt, user_prompt, temperature, max_tokens):
+        """Blocking call to Ollama's native /api/chat with thinking disabled."""
+        body = {
+            "model": self.model_name,
+            "stream": False,
+            "think": False,
+            "options": {"num_predict": max_tokens},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if _model_supports_temperature(self.model_name):
+            body["options"]["temperature"] = temperature
+        data = _http_post_json(self._native_chat_url, body, timeout=300)
+        text = data.get("message", {}).get("content", "") or ""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     async def generate(
         self,
@@ -347,12 +428,20 @@ class OpenAICompatibleClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int = 500,
     ) -> str:
-        # Local servers (Ollama/vLLM) use classic `max_tokens`, not `max_completion_tokens`.
+        # Ollama: use the native endpoint with think:false (the OpenAI-compat endpoint
+        # ignores it and yields empty turns for thinking models). Run the blocking call
+        # in a thread so we don't stall the event loop.
+        if self._is_ollama:
+            return await asyncio.to_thread(
+                self._ollama_native, system_prompt, user_prompt, temperature, max_tokens
+            )
+        # Generic OpenAI-compatible host (OpenRouter/DashScope/vLLM): best-effort with
+        # the /no_think soft switch + inline <think> stripping. Classic `max_tokens`.
         kwargs = dict(
             model=self.model_name,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_prompt + "\n\n/no_think"},
             ],
             max_tokens=max_tokens,
         )

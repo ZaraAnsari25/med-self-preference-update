@@ -7,12 +7,38 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 import random
 import re
+import time
+import urllib.request
+import urllib.error
 
 from dotenv import load_dotenv
 
 
 # Load environment variables from .env file
 load_dotenv()
+
+
+def _http_post_json(url: str, payload: dict, timeout: int = 120, retries: int = 5) -> dict:
+    """POST JSON and return the parsed response, retrying with exponential backoff on
+    transient errors (HTTP 429/500/502/503/504, network timeouts). Used for the raw HTTP
+    endpoints (Gemini REST, Ollama native), which have no SDK-level retry."""
+    data = json.dumps(payload).encode()
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code in (429, 500, 502, 503, 504):
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_exc = e
+            time.sleep(min(2 ** attempt, 30))
+    raise last_exc
 
 @dataclass
 class PairwiseComparison:
@@ -75,7 +101,7 @@ class PairwiseEvaluator:
         """Initialize the evaluator with the judge model and matching API client.
 
         Args:
-            judge_model: Model ID (e.g. gpt-5.5, claude-sonnet-5, gemini-3.5, qwen3.6:35b).
+            judge_model: Model ID (e.g. gpt-5.5, claude-sonnet-5, gemini-3.1-flash-lite, qwen3.6:35b).
             judge_provider: one of JUDGE_PROVIDERS; auto-detected from model name if None.
                 openai / anthropic / gemini use native SDKs. openai_compatible targets
                 OPENAI_COMPAT_BASE_URL (local Ollama/vLLM, OpenRouter, DashScope, ...)
@@ -101,16 +127,30 @@ class PairwiseEvaluator:
             from anthropic import Anthropic
             self.client = Anthropic()
         elif provider == "gemini":
-            if not os.getenv("GOOGLE_API_KEY"):
+            key = os.getenv("GOOGLE_API_KEY")
+            if not key:
                 raise RuntimeError("GOOGLE_API_KEY is not set. Required for Gemini judge models.")
-            import google.generativeai as genai
-            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            self.client = genai.GenerativeModel(judge_model)
+            # Use REST directly: Gemini 3.x flash "thinks" and the old SDK can't disable it,
+            # so thinking ate the token budget and truncated the JSON. REST lets us set
+            # thinkingConfig.thinkingBudget=0 (thinking OFF) -> faster, complete JSON.
+            self.client = None
+            self._gemini_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/{judge_model}"
+                f":generateContent?key={key}"
+            )
         else:  # openai_compatible (Qwen/DeepSeek/local/OpenRouter/DashScope)
             from openai import OpenAI
-            base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
-            api_key = os.getenv("OPENAI_COMPAT_API_KEY", "ollama")
-            self.client = OpenAI(base_url=base_url, api_key=api_key)
+            self.compat_base_url = os.getenv("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
+            self.compat_api_key = os.getenv("OPENAI_COMPAT_API_KEY", "ollama")
+            self.client = OpenAI(base_url=self.compat_base_url, api_key=self.compat_api_key)
+            # Ollama detection: for thinking models the OpenAI-compat endpoint ignores
+            # think/`/no_think` and returns EMPTY content (reasoning eats the budget).
+            # Only native /api/chat with "think": false works. Verified on qwen3.6:35b.
+            self._is_ollama = ("11434" in self.compat_base_url) or (self.compat_api_key.lower() == "ollama")
+            native = self.compat_base_url.rstrip("/")
+            if native.endswith("/v1"):
+                native = native[:-3]
+            self._native_chat_url = native.rstrip("/") + "/api/chat"
 
     def load_conversations(self, filepath: str) -> Dict[str, Dict]:
         """Load conversations and index by scenario_id."""
@@ -217,37 +257,76 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
         except json.JSONDecodeError:
             return None
 
+    def _valid_judge_json(self, data: Optional[dict]) -> bool:
+        """True only if the parsed judge JSON has the full expected schema: both sides
+        scored on all five criteria plus a preference. Lets the caller retry on a parsed-
+        but-malformed response (e.g. a truncated one missing 'conversation_a') instead of
+        crashing/dropping it."""
+        if not isinstance(data, dict) or "preference" not in data:
+            return False
+        crits = ("faithfulness", "completeness", "safety", "clarity", "conciseness")
+        for side in ("conversation_a", "conversation_b"):
+            block = data.get(side)
+            if not isinstance(block, dict):
+                return False
+            for c in crits:
+                cell = block.get(c)
+                if not isinstance(cell, dict) or "score" not in cell:
+                    return False
+        return True
+
     def _call_judge(self, prompt: str) -> str:
         """Call the judge model and return the response text (provider-aware)."""
         if self._provider == "openai":
-            response = self.client.chat.completions.create(
+            kw = dict(
                 model=self.judge_model,
                 messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=1500,
+                max_completion_tokens=4096,
             )
+            # Turn reasoning OFF for GPT-5.x/o-series judges (consistency + speed). Valid:
+            # none/low/medium/high/xhigh; override via OPENAI_REASONING_EFFORT.
+            jm = self.judge_model.lower()
+            if jm.startswith(("gpt-5", "o1", "o3", "o4")):
+                kw["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT", "none")
+            response = self.client.chat.completions.create(**kw)
             return response.choices[0].message.content or ""
         elif self._provider == "anthropic":
             message = self.client.messages.create(
                 model=self.judge_model,
-                max_tokens=1500,
+                max_tokens=4096,  # headroom for extended-thinking Claude models
                 messages=[{"role": "user", "content": prompt}],
             )
             # Extended-thinking models (e.g. Claude 5) return thinking blocks
             # first; concatenate only the text blocks (thinking blocks have no .text).
             return "".join(getattr(b, "text", "") for b in message.content)
         elif self._provider == "gemini":
-            response = self.client.generate_content(
-                prompt,
-                generation_config={"max_output_tokens": 1500},
-            )
-            return getattr(response, "text", "") or ""
+            # REST with thinking OFF (thinkingBudget=0). Gemini 3.x flash otherwise spends
+            # the token budget on hidden reasoning and truncates the JSON. 8192 is ample
+            # headroom for the comparison JSON once thinking is disabled.
+            gen_cfg = {"maxOutputTokens": 8192, "thinkingConfig": {"thinkingBudget": 0}}
+            payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_cfg}
+            data = _http_post_json(self._gemini_url, payload, timeout=120)
+            cand = (data.get("candidates") or [{}])[0]
+            return "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
         else:  # openai_compatible: local Ollama/vLLM, OpenRouter, DashScope
-            # Ask the model to skip its thinking channel (Qwen/DeepSeek) so the
-            # response is clean JSON; also strip any inline <think>...</think>.
+            # Ollama: native /api/chat with think:false (the compat endpoint ignores it
+            # and returns empty content for thinking judges -> unparseable, dropped).
+            if self._is_ollama:
+                body = {
+                    "model": self.judge_model,
+                    "stream": False,
+                    "think": False,
+                    "options": {"num_predict": 4096},
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                data = _http_post_json(self._native_chat_url, body, timeout=300)
+                text = data.get("message", {}).get("content", "") or ""
+                return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            # Generic OpenAI-compatible host: best-effort /no_think soft switch + strip.
             response = self.client.chat.completions.create(
                 model=self.judge_model,
                 messages=[{"role": "user", "content": prompt + "\n\n/no_think"}],
-                max_tokens=1500,
+                max_tokens=4096,
             )
             text = response.choices[0].message.content or ""
             return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -284,10 +363,11 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
                 )
                 response_text = self._call_judge(call_prompt)
                 data = self._extract_json(response_text)
-                if data is not None:
+                if self._valid_judge_json(data):
                     break
+                data = None  # parsed but malformed (e.g. truncated) -> retry
             if data is None:
-                print("  Error: No valid JSON in response (after retries)")
+                print("  Error: No valid/complete JSON in response (after retries)")
                 return None
 
             a_scores = [
