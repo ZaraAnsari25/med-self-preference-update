@@ -34,6 +34,9 @@ PY=${PY:-python}
 N=${1:-125}
 GEN_TURNS=${2:-8}
 T=${3:-500}
+# Concurrency for generation + evaluation (cloud models fan out; Qwen is gated by
+# OLLAMA_NUM_PARALLEL set in the sbatch). Lower if you hit provider rate limits (429).
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-12}
 
 # Turn counts to evaluate. Each MUST be <= GEN_TURNS. The one equal to GEN_TURNS is
 # the generated file; the strictly-smaller ones are derived by truncation.
@@ -72,6 +75,7 @@ echo "=== 4-model run STARTED $(date) | N=$N GEN=${GEN_TURNS}t EVAL=${FITTING_TU
   --models "${MODELS[@]}" \
   --patient_model "$PATIENT" \
   --max_tokens_per_turn "$T" \
+  --max_concurrency "$MAX_CONCURRENCY" \
   --output_dir "$GEN_DIR" >> "$LOG" 2>&1 \
 && echo "=== GENERATION done $(date) ===" | tee -a "$LOG" \
 || { echo "=== GENERATION FAILED $(date) ===" | tee -a "$LOG"; exit 1; }
@@ -114,6 +118,7 @@ for ((i=0; i<n; i++)); do
       --turns "${FITTING_TURNS[@]}" \
       --judge_models "$A" "$B" \
       --scenarios "$GEN_DIR/scenarios.json" \
+      --max_concurrency "$MAX_CONCURRENCY" \
       --output_dir "$EVAL_DIR" >> "$LOG" 2>&1
 
     # Self-preference analysis per length (judge files are named by judge id + turn count).

@@ -644,38 +644,56 @@ async def generate_all_conversations(
     patient_temperature: float = 0.8,
     max_tokens_per_turn: int = 500,
     enable_repair: bool = False,
+    max_concurrency: int = 12,
 ) -> Dict[str, List[GeneratedConversation]]:
-    """Generate conversations for all scenarios across all models."""
+    """Generate conversations for all scenarios across all models.
+
+    Conversations are independent, so we run up to `max_concurrency` of them at once
+    (turns WITHIN a conversation stay sequential -- each turn conditions on the prior).
+    Cloud models fan out freely; Qwen serializes on its one GPU (bounded by Ollama's
+    OLLAMA_NUM_PARALLEL). Output order is preserved (sorted by original scenario index).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     patient_client = get_client(patient_simulator_model)
+    sem = asyncio.Semaphore(max_concurrency)
 
     results = {model: [] for model in physician_models}
 
     for model_name in physician_models:
-        print(f"\nGenerating conversations with {model_name}")
+        print(f"\nGenerating {len(scenarios)} conversations with {model_name} "
+              f"(up to {max_concurrency} concurrent)")
 
         physician_client = get_client(model_name)
 
-        for scenario in tqdm(scenarios, desc=f"{model_name}"):
-            try:
-                conv = await generate_single_conversation(
-                    scenario=scenario,
-                    physician_client=physician_client,
-                    patient_client=patient_client,
-                    num_turns=num_turns,
-                    physician_temperature=physician_temperature,
-                    patient_temperature=patient_temperature,
-                    max_tokens_per_turn=max_tokens_per_turn,
-                    enable_repair=enable_repair,
-                )
-                results[model_name].append(conv)
-                
-            except Exception as e:
-                print(f"Error generating for scenario {scenario.scenario_id}: {e}")
-                continue
+        async def _one(idx: int, scenario: MedicalScenario):
+            async with sem:
+                try:
+                    conv = await generate_single_conversation(
+                        scenario=scenario,
+                        physician_client=physician_client,
+                        patient_client=patient_client,
+                        num_turns=num_turns,
+                        physician_temperature=physician_temperature,
+                        patient_temperature=patient_temperature,
+                        max_tokens_per_turn=max_tokens_per_turn,
+                        enable_repair=enable_repair,
+                    )
+                    return idx, conv
+                except Exception as e:
+                    print(f"Error generating for scenario {scenario.scenario_id}: {e}")
+                    return idx, None
 
-        save_conversations(results[model_name], output_dir / f"{model_name}_{num_turns}t_conversations.json")
+        tasks = [asyncio.ensure_future(_one(i, s)) for i, s in enumerate(scenarios)]
+        by_idx: Dict[int, Optional[GeneratedConversation]] = {}
+        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"{model_name}"):
+            idx, conv = await fut
+            by_idx[idx] = conv
+        # Re-sort into original scenario order and drop failures.
+        convs = [by_idx[i] for i in range(len(scenarios)) if by_idx.get(i) is not None]
+        results[model_name] = convs
+
+        save_conversations(convs, output_dir / f"{model_name}_{num_turns}t_conversations.json")
 
     return results
 
@@ -770,8 +788,21 @@ async def main():
                         help="Max tokens per turn (default from config or 500)")
     parser.add_argument("--repair", action="store_true",
                         help="Enable 1-pass repair rewrite when a turn violates constraints")
-    
+    parser.add_argument("--max_concurrency", type=int, default=12,
+                        help="Max conversations generated concurrently (cloud models fan out; "
+                             "Qwen is bounded by OLLAMA_NUM_PARALLEL). Lower if you hit 429s.")
+
     args = parser.parse_args()
+
+    # Enlarge the default thread pool so the blocking to_thread clients (Gemini REST,
+    # Qwen/Ollama native) can actually run `max_concurrency` calls at once rather than
+    # queueing behind the small default executor (~cpu+4 workers).
+    import concurrent.futures
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(32, args.max_concurrency * 2), thread_name_prefix="gen"
+        )
+    )
 
     cfg = load_yaml_config(args.config)
 
@@ -821,6 +852,7 @@ async def main():
         patient_temperature=patient_temperature,
         max_tokens_per_turn=max_tokens_per_turn,
         enable_repair=args.repair,
+        max_concurrency=args.max_concurrency,
     )
     all_conversations = []
     for model, convs in results.items():

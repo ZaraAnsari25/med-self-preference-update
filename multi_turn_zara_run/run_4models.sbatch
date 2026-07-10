@@ -41,6 +41,13 @@ export OLLAMA_MODELS=$SCRATCH/ollama/models
 export OLLAMA_HOST=127.0.0.1:11434
 mkdir -p "$HF_HOME" "$OLLAMA_MODELS"
 
+# ---- Concurrency ----
+# Cloud models fan out at MAX_CONCURRENCY (passed to both python stages by run_4models.sh).
+# Let Ollama serve that many Qwen requests at once (H100-80GB batches this fine) so Qwen
+# isn't the serial bottleneck. OLLAMA_NUM_PARALLEL MUST be exported before `ollama serve`.
+export MAX_CONCURRENCY="${MAX_CONCURRENCY:-12}"
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-8}"
+
 # ---- Python env ----
 module load python/3.12.1
 source "$SCRATCH/venvs/med-self-pref/bin/activate"

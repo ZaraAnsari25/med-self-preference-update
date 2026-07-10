@@ -10,6 +10,7 @@ import re
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
@@ -335,15 +336,20 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
         self,
         conversation_a: Dict,
         conversation_b: Dict,
-        scenario: Dict
+        scenario: Dict,
+        swap: bool = False,
     ) -> Optional[PairwiseComparison]:
-        """Compare two conversations and return preference (identity-blind, randomized A/B order)."""
+        """Compare two conversations and return preference (identity-blind).
 
-        # Randomize which generator is shown as A/B to mitigate positional bias
-        randomized = False
-        if random.random() < 0.5:
+        `swap` (whether to show gen_b in slot A) is decided by the CALLER from a
+        deterministic (seed, scenario_id) key -- NOT from a shared RNG here -- so the A/B
+        presentation is identical across judges and independent of execution order. That
+        keeps positional bias a common factor that cancels in the cross-judge SPI, even
+        under parallel evaluation. See evaluate_pairs._swap_for."""
+
+        randomized = swap
+        if swap:
             conversation_a, conversation_b = conversation_b, conversation_a
-            randomized = True
 
         prompt = self._create_pairwise_prompt(conversation_a, conversation_b, scenario)
 
@@ -425,53 +431,72 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
             print(f"  Error comparing conversations: {e}")
             return None
 
+    @staticmethod
+    def _swap_for(seed: int, scenario_id: str) -> bool:
+        """Deterministic A/B swap decision for a scenario, keyed by (seed, scenario_id).
+
+        Independent of execution order and of which judge is running, so every judge
+        presents the same scenario in the same slot -> positional bias cancels in the
+        cross-judge SPI, and it's safe under parallel (thread) evaluation."""
+        return random.Random(f"{seed}:{scenario_id}").random() < 0.5
+
     def evaluate_pairs(
         self,
         conversations_a: Dict[str, Dict],
         conversations_b: Dict[str, Dict],
         scenarios: Dict[str, Dict],
         sample_size: Optional[int] = None,
+        seed: int = 42,
+        max_workers: int = 12,
     ) -> List[PairwiseComparison]:
-        """Compare conversations from two models on matching scenarios."""
+        """Compare conversations from two models on matching scenarios.
 
-        common_scenarios = set(conversations_a.keys()) & set(conversations_b.keys())
+        Comparisons are independent single calls, so we run up to `max_workers` at once in
+        a thread pool. A/B swaps are pre-decided deterministically from (seed, scenario_id)
+        so parallelism can't change the presentation (see _swap_for)."""
+
+        common_scenarios = sorted(set(conversations_a.keys()) & set(conversations_b.keys()))
         print(f"\nFound {len(common_scenarios)} common scenarios")
 
         if sample_size:
-            common_scenarios = set(
-                random.sample(list(common_scenarios), min(sample_size, len(common_scenarios)))
+            # Local seeded RNG so sampling is reproducible and independent of the A/B keying.
+            common_scenarios = sorted(
+                random.Random(seed).sample(common_scenarios, min(sample_size, len(common_scenarios)))
             )
             print(f"Sampling {len(common_scenarios)} for comparison")
 
-        comparisons: List[PairwiseComparison] = []
-
         model_a_name = list(conversations_a.values())[0]["generator_model"] if conversations_a else "Unknown"
         model_b_name = list(conversations_b.values())[0]["generator_model"] if conversations_b else "Unknown"
-
-        print(f"\nComparing {model_a_name} vs {model_b_name}...")
+        print(f"\nComparing {model_a_name} vs {model_b_name} "
+              f"({len(common_scenarios)} scenarios, up to {max_workers} concurrent)...")
         print(f"{'='*60}")
 
-        for i, scenario_id in enumerate(sorted(common_scenarios), 1):
-            print(f"\n[{i}/{len(common_scenarios)}] Scenario: {scenario_id}")
+        def _task(scenario_id: str) -> Optional[PairwiseComparison]:
+            return self.compare_conversations(
+                conversations_a[scenario_id],
+                conversations_b[scenario_id],
+                scenarios.get(scenario_id, {"scenario_id": scenario_id}),
+                swap=self._swap_for(seed, scenario_id),
+            )
 
-            convo_a = conversations_a[scenario_id]
-            convo_b = conversations_b[scenario_id]
-            scenario = scenarios.get(scenario_id, {"scenario_id": scenario_id})
+        by_sid: Dict[str, Optional[PairwiseComparison]] = {}
+        done = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_task, sid): sid for sid in common_scenarios}
+            for fut in as_completed(futures):
+                sid = futures[fut]
+                done += 1
+                try:
+                    by_sid[sid] = fut.result()
+                except Exception as e:
+                    print(f"  [{sid}] error: {e}")
+                    by_sid[sid] = None
+                if done % 25 == 0 or done == len(common_scenarios):
+                    ok = sum(1 for v in by_sid.values() if v is not None)
+                    print(f"  ...{done}/{len(common_scenarios)} done ({ok} ok)")
 
-            comparison = self.compare_conversations(convo_a, convo_b, scenario)
-
-            if comparison:
-                comparisons.append(comparison)
-                print(f"  Preference: {comparison.preference} (confidence: {comparison.confidence:.2f})")
-                print(
-                    f"  Shown-A ({comparison.conversation_a_model}): {comparison.a_overall:.2f}/5.0 | "
-                    f"Shown-B ({comparison.conversation_b_model}): {comparison.b_overall:.2f}/5.0"
-                )
-                if comparison.randomized:
-                    print("  Note: A/B order was randomized (swapped).")
-            else:
-                print("  Skipped (error)")
-
+        # Preserve deterministic (sorted-scenario) order in the output; drop failures.
+        comparisons = [by_sid[sid] for sid in common_scenarios if by_sid.get(sid) is not None]
         return comparisons
 
     def save_comparisons(self, comparisons: List[PairwiseComparison], output_file: str):
@@ -620,7 +645,11 @@ async def main():
     parser.add_argument("--output_dir", default="evals",
                         help="Directory for result files")
     parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed (reset per cell so every judge sees identical A/B order)")
+                        help="Random seed governing A/B order (per-scenario, so every judge "
+                             "sees identical A/B regardless of order/parallelism) and sampling")
+    parser.add_argument("--max_concurrency", type=int, default=12,
+                        help="Max comparisons judged concurrently per cell. For a Qwen judge "
+                             "this is gated by OLLAMA_NUM_PARALLEL. Lower if you hit 429s.")
 
     args = parser.parse_args()
 
@@ -633,10 +662,9 @@ async def main():
         b_file = Path(args.conv_dir) / f"{args.gen_b}_{n}t_conversations.json"
 
         for judge in args.judge_models:
-            # Reset RNG per cell so scenario sampling and A/B randomization are
-            # identical across judges for the same turn count (fair comparison).
-            random.seed(args.seed)
-
+            # A/B order is keyed per-scenario by (seed, scenario_id) inside evaluate_pairs,
+            # so every judge sees identical A/B regardless of order or parallelism -- no
+            # global RNG reseed needed.
             print(f"\n{'#'*70}\n# {n}t | judge={judge}\n{'#'*70}")
             evaluator = PairwiseEvaluator(judge_model=judge)
 
@@ -647,6 +675,8 @@ async def main():
             comparisons = evaluator.evaluate_pairs(
                 convos_a, convos_b, scenarios,
                 sample_size=args.sample_size,
+                seed=args.seed,
+                max_workers=args.max_concurrency,
             )
 
             output = output_dir / f"pairwise_{args.gen_a}_vs_{args.gen_b}_{n}t_{judge}_Judge.json"
