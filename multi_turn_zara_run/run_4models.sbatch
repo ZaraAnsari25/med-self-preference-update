@@ -22,6 +22,8 @@
 #SBATCH -J med-selfpref
 #SBATCH -o multi_turn_zara_run/slurm_%j.out
 #SBATCH -e multi_turn_zara_run/slurm_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=zansari6@stanford.edu
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
