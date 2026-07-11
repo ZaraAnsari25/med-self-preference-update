@@ -47,6 +47,12 @@ def _http_post_json(url: str, payload: dict, timeout: int = 120, retries: int = 
             time.sleep(min(2 ** attempt, 30))
     raise last_exc
 
+
+def _think_headroom() -> int:
+    """Extra output tokens to allow when a model is THINKING, so hidden reasoning doesn't
+    consume the answer budget and leave empty/truncated output. Override THINK_TOKEN_HEADROOM."""
+    return int(os.getenv("THINK_TOKEN_HEADROOM", "8192"))
+
 @dataclass
 class MedicalScenario:
     """Seed scenario extracted from HealthCareMagic dataset."""
@@ -251,6 +257,23 @@ def _model_supports_temperature(model_name: str) -> bool:
     return True
 
 
+def _claude_uses_adaptive_thinking(model_name: str) -> bool:
+    """Claude 4.6+ / 5 use the adaptive-thinking API (thinking={"type":"adaptive"} +
+    output_config.effort); the old thinking={"type":"enabled","budget_tokens":N} is
+    rejected (400). These models also think by DEFAULT when `thinking` is omitted, so
+    no-think mode must send {"type":"disabled"} explicitly."""
+    m = model_name.lower()
+    return bool(re.search(r"claude-(sonnet|opus|haiku|fable)-5", m)) or bool(
+        re.search(r"claude-(sonnet|opus)-4-[678]", m)
+    )
+
+
+def _claude_effort() -> str:
+    """Requested Claude thinking effort. Empty/none/off/disabled -> thinking OFF.
+    Otherwise one of low/medium/high/xhigh/max -> adaptive thinking at that effort."""
+    return os.getenv("CLAUDE_THINKING_EFFORT", "").strip().lower()
+
+
 class OpenAIClient(LLMClient):
     """OpenAI API client."""
     
@@ -290,6 +313,9 @@ class OpenAIClient(LLMClient):
             effort = os.getenv("OPENAI_REASONING_EFFORT", "none")
             if effort:
                 kwargs["reasoning_effort"] = effort
+            if effort and effort.lower() != "none":
+                # reasoning shares max_completion_tokens; add headroom so the answer fits.
+                kwargs["max_completion_tokens"] = max_tokens + _think_headroom()
         response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
 
@@ -323,6 +349,20 @@ class AnthropicClient(LLMClient):
         )
         if _model_supports_temperature(self.model_name):
             kwargs["temperature"] = temperature
+        # Thinking control for Claude 4.6+/5 (adaptive-thinking API; the old
+        # {"type":"enabled","budget_tokens":N} is rejected with a 400). These models
+        # think by default, so no-think mode disables explicitly. Effort levels:
+        # low/medium/high/xhigh/max. Adaptive thinking shares the max_tokens budget, so
+        # add headroom to avoid empty/truncated answers.
+        if _claude_uses_adaptive_thinking(self.model_name):
+            effort = _claude_effort()
+            if effort in ("", "none", "off", "0", "disabled"):
+                kwargs["thinking"] = {"type": "disabled"}
+            else:
+                kwargs["thinking"] = {"type": "adaptive"}
+                kwargs["output_config"] = {"effort": effort}
+                kwargs["max_tokens"] = max_tokens + _think_headroom()
+                kwargs.pop("temperature", None)
         response = await self.client.messages.create(**kwargs)
         # Extended-thinking models (e.g. Claude 5) return thinking blocks first;
         # concatenate only the text blocks (thinking blocks have no .text).
@@ -353,10 +393,14 @@ class GeminiClient(LLMClient):
 
     def _rest(self, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> str:
         full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
+        # thinkingBudget: 0=off (default), -1=dynamic, N=fixed. Thinking shares
+        # maxOutputTokens, so add headroom when on to keep the answer from truncating.
+        budget = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
+        max_out = max_tokens + (_think_headroom() if budget != 0 else 0)
         gen_cfg = {
             "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-            "thinkingConfig": {"thinkingBudget": 0},  # thinking OFF
+            "maxOutputTokens": max_out,
+            "thinkingConfig": {"thinkingBudget": budget},
         }
         payload = {
             "contents": [{"parts": [{"text": full_prompt}]}],
@@ -404,12 +448,14 @@ class OpenAICompatibleClient(LLMClient):
         self._native_chat_url = native.rstrip("/") + "/api/chat"
 
     def _ollama_native(self, system_prompt, user_prompt, temperature, max_tokens):
-        """Blocking call to Ollama's native /api/chat with thinking disabled."""
+        """Blocking call to Ollama's native /api/chat. QWEN_THINK=1 enables thinking (with
+        token headroom so the answer isn't truncated); default (0) disables it."""
+        think = os.getenv("QWEN_THINK", "0") == "1"
         body = {
             "model": self.model_name,
             "stream": False,
-            "think": False,
-            "options": {"num_predict": max_tokens},
+            "think": think,
+            "options": {"num_predict": max_tokens + (_think_headroom() if think else 0)},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

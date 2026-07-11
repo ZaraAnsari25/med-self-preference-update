@@ -41,6 +41,28 @@ def _http_post_json(url: str, payload: dict, timeout: int = 120, retries: int = 
             time.sleep(min(2 ** attempt, 30))
     raise last_exc
 
+
+def _think_headroom() -> int:
+    """Extra output tokens to allow when a judge is THINKING, so hidden reasoning doesn't
+    consume the JSON budget and truncate it. Override THINK_TOKEN_HEADROOM."""
+    return int(os.getenv("THINK_TOKEN_HEADROOM", "8192"))
+
+
+def _claude_uses_adaptive_thinking(model_name: str) -> bool:
+    """Claude 4.6+/5 use the adaptive-thinking API (thinking={"type":"adaptive"} +
+    output_config.effort); the old {"type":"enabled","budget_tokens":N} is rejected (400).
+    These models also think by DEFAULT, so no-think mode must disable explicitly."""
+    m = model_name.lower()
+    return bool(re.search(r"claude-(sonnet|opus|haiku|fable)-5", m)) or bool(
+        re.search(r"claude-(sonnet|opus)-4-[678]", m)
+    )
+
+
+def _claude_effort() -> str:
+    """Requested Claude thinking effort. Empty/none/off/disabled -> thinking OFF;
+    otherwise low/medium/high/xhigh/max -> adaptive thinking at that effort."""
+    return os.getenv("CLAUDE_THINKING_EFFORT", "").strip().lower()
+
 @dataclass
 class PairwiseComparison:
     """Result of comparing two conversations."""
@@ -288,36 +310,51 @@ Ensure valid JSON with double quotes and escaped quotes inside explanations."""
             # none/low/medium/high/xhigh; override via OPENAI_REASONING_EFFORT.
             jm = self.judge_model.lower()
             if jm.startswith(("gpt-5", "o1", "o3", "o4")):
-                kw["reasoning_effort"] = os.getenv("OPENAI_REASONING_EFFORT", "none")
+                effort = os.getenv("OPENAI_REASONING_EFFORT", "none")
+                kw["reasoning_effort"] = effort
+                if effort and effort.lower() != "none":
+                    kw["max_completion_tokens"] = 4096 + _think_headroom()
             response = self.client.chat.completions.create(**kw)
             return response.choices[0].message.content or ""
         elif self._provider == "anthropic":
-            message = self.client.messages.create(
-                model=self.judge_model,
-                max_tokens=4096,  # headroom for extended-thinking Claude models
-                messages=[{"role": "user", "content": prompt}],
-            )
+            akw = dict(model=self.judge_model, max_tokens=4096,
+                       messages=[{"role": "user", "content": prompt}])
+            # Thinking control for Claude 4.6+/5 (adaptive-thinking API; the old
+            # {"type":"enabled","budget_tokens":N} is rejected with a 400). These models
+            # think by default, so no-think disables explicitly; thinking shares the
+            # max_tokens budget, so add headroom to avoid truncating the JSON verdict.
+            if _claude_uses_adaptive_thinking(self.judge_model):
+                effort = _claude_effort()
+                if effort in ("", "none", "off", "0", "disabled"):
+                    akw["thinking"] = {"type": "disabled"}
+                else:
+                    akw["thinking"] = {"type": "adaptive"}
+                    akw["output_config"] = {"effort": effort}
+                    akw["max_tokens"] = 4096 + _think_headroom()
+            message = self.client.messages.create(**akw)
             # Extended-thinking models (e.g. Claude 5) return thinking blocks
             # first; concatenate only the text blocks (thinking blocks have no .text).
             return "".join(getattr(b, "text", "") for b in message.content)
         elif self._provider == "gemini":
-            # REST with thinking OFF (thinkingBudget=0). Gemini 3.x flash otherwise spends
-            # the token budget on hidden reasoning and truncates the JSON. 8192 is ample
-            # headroom for the comparison JSON once thinking is disabled.
-            gen_cfg = {"maxOutputTokens": 8192, "thinkingConfig": {"thinkingBudget": 0}}
+            # thinkingBudget: 0=off (default), -1=dynamic, N=fixed. Thinking shares
+            # maxOutputTokens, so add headroom when on to avoid truncating the JSON.
+            budget = int(os.getenv("GEMINI_THINKING_BUDGET", "0"))
+            max_out = 8192 + (_think_headroom() if budget != 0 else 0)
+            gen_cfg = {"maxOutputTokens": max_out, "thinkingConfig": {"thinkingBudget": budget}}
             payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gen_cfg}
             data = _http_post_json(self._gemini_url, payload, timeout=120)
             cand = (data.get("candidates") or [{}])[0]
             return "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
         else:  # openai_compatible: local Ollama/vLLM, OpenRouter, DashScope
-            # Ollama: native /api/chat with think:false (the compat endpoint ignores it
-            # and returns empty content for thinking judges -> unparseable, dropped).
+            # Ollama: native /api/chat. QWEN_THINK=1 enables thinking (+ headroom); the
+            # compat endpoint ignores think and returns empty content for thinking judges.
             if self._is_ollama:
+                think = os.getenv("QWEN_THINK", "0") == "1"
                 body = {
                     "model": self.judge_model,
                     "stream": False,
-                    "think": False,
-                    "options": {"num_predict": 4096},
+                    "think": think,
+                    "options": {"num_predict": 4096 + (_think_headroom() if think else 0)},
                     "messages": [{"role": "user", "content": prompt}],
                 }
                 data = _http_post_json(self._native_chat_url, body, timeout=300)

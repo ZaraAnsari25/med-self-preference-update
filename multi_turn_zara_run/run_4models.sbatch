@@ -9,8 +9,10 @@
 # Everything is localhost, so no cross-node networking.
 #
 # SUBMIT (from project root):
-#   sbatch multi_turn_zara_run/run_4models.sbatch            # full run (defaults in run_4models.sh)
+#   sbatch multi_turn_zara_run/run_4models.sbatch            # full run, no-think (-> nothink/)
+#   THINK=1 sbatch multi_turn_zara_run/run_4models.sbatch    # full run, think mode (-> think/)
 #   SMOKE=1 sbatch multi_turn_zara_run/run_4models.sbatch    # smoke test (2 scenarios, real 8t design)
+#   THINK/SMOKE inherit via Slurm's default --export=ALL; combine them freely.
 # Watch:  squeue --me      Logs:  multi_turn_zara_run/slurm_<jobid>.out
 #
 #SBATCH -p roxanad

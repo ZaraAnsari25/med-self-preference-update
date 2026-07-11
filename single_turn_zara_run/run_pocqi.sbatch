@@ -4,8 +4,10 @@
 # (generate -> individual + pairwise eval -> SPI). All localhost on one GPU node.
 #
 # SUBMIT (from project root):
-#   sbatch single_turn_zara_run/run_pocqi.sbatch            # full run (125 questions)
+#   sbatch single_turn_zara_run/run_pocqi.sbatch            # full run, no-think (-> nothink/)
+#   THINK=1 sbatch single_turn_zara_run/run_pocqi.sbatch    # full run, think mode (-> think/)
 #   SMOKE=1 sbatch single_turn_zara_run/run_pocqi.sbatch    # smoke: 4 questions, all 4 models
+#   THINK/SMOKE inherit via Slurm's default --export=ALL; combine them freely.
 # Watch:  squeue --me     Logs:  single_turn_zara_run/slurm_<jobid>.out
 #
 #SBATCH -p roxanad

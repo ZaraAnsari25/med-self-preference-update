@@ -17,6 +17,12 @@
 #         freshly generated file; the rest are produced by truncation.
 #         e.g. `bash multi_turn_zara_run/run_4models.sh 5 4`  for a quick smoke test
 #              (generates 4t, evaluates whatever EVAL_TURNS entries are <= 4).
+#   Optional env:  THINK=0|1  (0=no-think [default], 1=think). Selects BOTH the output
+#                  directory AND the models' thinking mode, so the two studies' data stay
+#                  separate:  THINK=0 -> multi_turn_zara_run/nothink/...
+#                             THINK=1 -> multi_turn_zara_run/think/...
+#                  (mirror of single_turn_zara_run/run_pocqi.sh; additive — does not
+#                   change the physician<->patient generation logic).
 #
 # Prereqs in .env:  OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
 #   Qwen (local): Ollama running with the model pulled; the OpenAI-compatible
@@ -53,9 +59,30 @@ GEN_QWEN=${GEN_QWEN:-qwen3.6-35b}
 MODELS=("$GEN_ANTHROPIC" "$GEN_OPENAI" "$GEN_GEMINI" "$GEN_QWEN")
 PATIENT=${PATIENT_MODEL:-$GEN_OPENAI}
 
-GEN_DIR=multi_turn_zara_run/Generation
-EVAL_DIR=multi_turn_zara_run/Evaluation
-LOG="multi_turn_zara_run/run_4models_gen${GEN_TURNS}t_$(date +%Y%m%d_%H%M%S).log"
+# ---- Thinking mode -> output dir + per-model thinking knobs ----
+# Knobs are read by the model clients (generation + judges); defaults keep no-think, so
+# existing behavior is unchanged. THINK=1 turns thinking on consistently everywhere.
+# (Mirror of single_turn_zara_run/run_pocqi.sh.)
+THINK=${THINK:-0}
+if [ "$THINK" = "1" ]; then
+  MODE=think
+  export OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-medium}"   # gpt-5.x/o-series
+  export GEMINI_THINKING_BUDGET="${GEMINI_THINKING_BUDGET:--1}"          # gemini: -1 = dynamic
+  export QWEN_THINK="${QWEN_THINK:-1}"                                   # qwen: enable thinking
+  export CLAUDE_THINKING_EFFORT="${CLAUDE_THINKING_EFFORT:-medium}"      # claude 5: adaptive @ effort
+else
+  MODE=nothink
+  export OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-none}"
+  export GEMINI_THINKING_BUDGET="${GEMINI_THINKING_BUDGET:-0}"
+  export QWEN_THINK="${QWEN_THINK:-0}"
+  export CLAUDE_THINKING_EFFORT="${CLAUDE_THINKING_EFFORT:-none}"        # claude 5: thinking OFF
+fi
+
+RUN_DIR=multi_turn_zara_run/$MODE
+GEN_DIR=$RUN_DIR/Generation
+EVAL_DIR=$RUN_DIR/Evaluation
+mkdir -p "$GEN_DIR" "$EVAL_DIR"
+LOG="$RUN_DIR/run_4models_gen${GEN_TURNS}t_$(date +%Y%m%d_%H%M%S).log"
 
 # Keep only EVAL_TURNS entries that fit within GEN_TURNS (drop any that exceed it).
 FITTING_TURNS=()
@@ -67,7 +94,8 @@ for t in "${EVAL_TURNS[@]}"; do
   fi
 done
 
-echo "=== 4-model run STARTED $(date) | N=$N GEN=${GEN_TURNS}t EVAL=${FITTING_TURNS[*]} T=$T | models: ${MODELS[*]} ===" | tee "$LOG"
+echo "=== 4-model run STARTED $(date) | MODE=$MODE (THINK=$THINK) N=$N GEN=${GEN_TURNS}t EVAL=${FITTING_TURNS[*]} T=$T | models: ${MODELS[*]} ===" | tee "$LOG"
+echo "    thinking knobs: OPENAI_REASONING_EFFORT=$OPENAI_REASONING_EFFORT GEMINI_THINKING_BUDGET=$GEMINI_THINKING_BUDGET QWEN_THINK=$QWEN_THINK CLAUDE_THINKING_EFFORT=$CLAUDE_THINKING_EFFORT | out=$RUN_DIR" | tee -a "$LOG"
 
 # ---- Stage 1: generate ALL 4 models once, at the longest length ----
 "$PY" src/generation/generate_conversations.py \

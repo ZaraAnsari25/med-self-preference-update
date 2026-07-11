@@ -10,6 +10,11 @@
 #           MAXTOK  = max tokens per answer  (default 1024)
 #   Optional env:  SPECIALTY="Cardiology,Neurology"  (restrict specialties; default all)
 #                  MAX_CONCURRENCY=12   (cloud fan-out; Qwen gated by OLLAMA_NUM_PARALLEL)
+#                  THINK=0|1            (0=no-think [default], 1=think). Selects BOTH the
+#                                        output directory AND the models' thinking mode, so
+#                                        the two studies' data stay separate:
+#                                          THINK=0 -> single_turn_zara_run/nothink/...
+#                                          THINK=1 -> single_turn_zara_run/think/...
 #
 # On Sherlock submit via run_pocqi.sbatch (starts local Ollama for Qwen).
 
@@ -26,12 +31,32 @@ SPECIALTY_ARG=()
 # Specialist models under study (each answers every question). Same 4 as multi-turn.
 MODELS=(claude-sonnet-5 gpt-5.5 gemini-3.1-flash-lite qwen3.6-35b)
 
-GEN_DIR=single_turn_zara_run/Generation
-EVAL_DIR=single_turn_zara_run/Evaluation
-LOG="single_turn_zara_run/run_pocqi_$(date +%Y%m%d_%H%M%S).log"
+# ---- Thinking mode -> output dir + per-model thinking knobs ----
+# Knobs are read by the model clients (generation + judges); defaults keep no-think, so
+# existing pipelines are unaffected. THINK=1 turns thinking on consistently everywhere.
+THINK=${THINK:-0}
+if [ "$THINK" = "1" ]; then
+  MODE=think
+  export OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-medium}"   # gpt-5.x/o-series
+  export GEMINI_THINKING_BUDGET="${GEMINI_THINKING_BUDGET:--1}"          # gemini: -1 = dynamic
+  export QWEN_THINK="${QWEN_THINK:-1}"                                   # qwen: enable thinking
+  export CLAUDE_THINKING_EFFORT="${CLAUDE_THINKING_EFFORT:-medium}"      # claude 5: adaptive @ effort
+else
+  MODE=nothink
+  export OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-none}"
+  export GEMINI_THINKING_BUDGET="${GEMINI_THINKING_BUDGET:-0}"
+  export QWEN_THINK="${QWEN_THINK:-0}"
+  export CLAUDE_THINKING_EFFORT="${CLAUDE_THINKING_EFFORT:-none}"        # claude 5: thinking OFF
+fi
+
+RUN_DIR=single_turn_zara_run/$MODE
+GEN_DIR=$RUN_DIR/Generation
+EVAL_DIR=$RUN_DIR/Evaluation
+LOG="$RUN_DIR/run_pocqi_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p "$GEN_DIR" "$EVAL_DIR"
 
-echo "=== POCQi single-turn run STARTED $(date) | N=$N MAXTOK=$MAXTOK specialty='${SPECIALTY:-ALL}' | models: ${MODELS[*]} ===" | tee "$LOG"
+echo "=== POCQi single-turn run STARTED $(date) | MODE=$MODE (THINK=$THINK) N=$N MAXTOK=$MAXTOK specialty='${SPECIALTY:-ALL}' | models: ${MODELS[*]} ===" | tee "$LOG"
+echo "    thinking knobs: OPENAI_REASONING_EFFORT=$OPENAI_REASONING_EFFORT GEMINI_THINKING_BUDGET=$GEMINI_THINKING_BUDGET QWEN_THINK=$QWEN_THINK CLAUDE_THINKING_EFFORT=$CLAUDE_THINKING_EFFORT | out=$RUN_DIR" | tee -a "$LOG"
 
 # ---- Stage 1: generate specialist answers (all models) ----
 "$PY" src/generation/generate_single_turn_pocqi.py \
