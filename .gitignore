@@ -17,3 +17,10 @@ multi_turn_zara_run/Evaluation/
 multi_turn_zara_run/*.log
 multi_turn_zara_run/*.out
 multi_turn_zara_run/*.err
+
+# single-turn (Real-POCQi) run outputs (regenerable; keep the .sh/.sbatch scripts)
+single_turn_zara_run/Generation/
+single_turn_zara_run/Evaluation/
+single_turn_zara_run/*.log
+single_turn_zara_run/*.out
+single_turn_zara_run/*.err
