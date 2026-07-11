@@ -71,31 +71,54 @@ echo "    thinking knobs: OPENAI_REASONING_EFFORT=$OPENAI_REASONING_EFFORT GEMIN
 rf() { echo "$GEN_DIR/$1_pocqi_responses.json"; }
 
 # ---- Stage 2: INDIVIDUAL absolute scoring — every generator by every judge ----
-for gen in "${MODELS[@]}"; do
-  for judge in "${MODELS[@]}"; do
-    [ -f "$(rf "$gen")" ] || continue
-    "$PY" src/evaluation/evaluate_pocqi.py --mode individual \
-      --response_file "$(rf "$gen")" --judge_model "$judge" \
-      --max_concurrency "$MAX_CONCURRENCY" \
-      --output "$EVAL_DIR/individual_${gen}_by_${judge}.json" >> "$LOG" 2>&1
-  done
+# Parallelized by JUDGE: each judge (a distinct provider) runs in its own background
+# subshell and scores its generators SEQUENTIALLY, so any one provider still sees at most
+# MAX_CONCURRENCY calls at once (unchanged) while the 4 providers overlap -> ~4x. Errors
+# are best-effort (logged), matching the prior sequential behavior.
+for judge in "${MODELS[@]}"; do
+  (
+    for gen in "${MODELS[@]}"; do
+      [ -f "$(rf "$gen")" ] || continue
+      "$PY" src/evaluation/evaluate_pocqi.py --mode individual \
+        --response_file "$(rf "$gen")" --judge_model "$judge" \
+        --max_concurrency "$MAX_CONCURRENCY" \
+        --output "$EVAL_DIR/individual_${gen}_by_${judge}.json" >> "$LOG" 2>&1
+    done
+  ) &
 done
+wait
 echo "=== INDIVIDUAL scoring done $(date) ===" | tee -a "$LOG"
 
 # ---- Stage 3: PAIRWISE for all C(4,2)=6 pairs, each judged by its own two models, + SPI ----
 n=${#MODELS[@]}
+
+# Phase 3a: run every pairwise JUDGE evaluation, grouped by JUDGE. Each judge (distinct
+# provider) runs its pairs SEQUENTIALLY in a background subshell, so per-provider load
+# stays at MAX_CONCURRENCY (unchanged) while the 4 judges overlap -> ~4x. A judge only
+# scores the pairs it belongs to (every pair is judged by BOTH its models). The A/B swap
+# is a pure function of (--seed, scenario_id), so it is unaffected by this parallelism.
+for judge in "${MODELS[@]}"; do
+  (
+    for ((i=0; i<n; i++)); do
+      for ((j=i+1; j<n; j++)); do
+        A=${MODELS[$i]}; B=${MODELS[$j]}
+        [ "$judge" = "$A" ] || [ "$judge" = "$B" ] || continue
+        [ -f "$(rf "$A")" ] && [ -f "$(rf "$B")" ] || continue
+        "$PY" src/evaluation/evaluate_pocqi.py --mode pairwise \
+          --response_file_a "$(rf "$A")" --response_file_b "$(rf "$B")" \
+          --judge_model "$judge" --seed 42 --max_concurrency "$MAX_CONCURRENCY" \
+          --output "$EVAL_DIR/pairwise_${A}_vs_${B}_${judge}_Judge.json" >> "$LOG" 2>&1
+      done
+    done
+  ) &
+done
+wait
+echo "=== PAIRWISE judging done $(date) ===" | tee -a "$LOG"
+
+# Phase 3b: per-pair self-preference analysis (CPU-only, fast). Needs BOTH judge files.
 for ((i=0; i<n; i++)); do
   for ((j=i+1; j<n; j++)); do
     A=${MODELS[$i]}; B=${MODELS[$j]}
-    [ -f "$(rf "$A")" ] && [ -f "$(rf "$B")" ] || { echo "  (skip pair $A vs $B: missing responses)" | tee -a "$LOG"; continue; }
-    echo "=== PAIR: $A vs $B | judges: $A, $B | $(date) ===" | tee -a "$LOG"
-    for judge in "$A" "$B"; do
-      "$PY" src/evaluation/evaluate_pocqi.py --mode pairwise \
-        --response_file_a "$(rf "$A")" --response_file_b "$(rf "$B")" \
-        --judge_model "$judge" --seed 42 --max_concurrency "$MAX_CONCURRENCY" \
-        --output "$EVAL_DIR/pairwise_${A}_vs_${B}_${judge}_Judge.json" >> "$LOG" 2>&1
-    done
-    # Pairwise SPI for this pair (reuse the multi-turn analyzer, unchanged).
     JA="$EVAL_DIR/pairwise_${A}_vs_${B}_${A}_Judge.json"
     JB="$EVAL_DIR/pairwise_${A}_vs_${B}_${B}_Judge.json"
     if [ -f "$JA" ] && [ -f "$JB" ]; then
@@ -110,6 +133,8 @@ for ((i=0; i<n; i++)); do
       "$PY" src/evaluation/preference_breakdown.py \
         --judge_files "$JA" "$JB" \
         --output "$EVAL_DIR/preference_${A}_vs_${B}.json" >> "$LOG" 2>&1
+    else
+      echo "  (skip analysis $A vs $B: missing one/both judge files)" | tee -a "$LOG"
     fi
   done
 done

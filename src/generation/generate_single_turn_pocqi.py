@@ -168,10 +168,14 @@ async def main():
     args = parser.parse_args()
 
     # Enlarge the thread pool so blocking to_thread clients (Gemini REST, Qwen native)
-    # actually run max_concurrency at once.
+    # actually run max_concurrency at once. Models now run CONCURRENTLY (see below), so
+    # scale by the model count too -- otherwise the blocking models would share one pool
+    # and throttle each other.
     import concurrent.futures
     asyncio.get_running_loop().set_default_executor(
-        concurrent.futures.ThreadPoolExecutor(max_workers=max(32, args.max_concurrency * 2))
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(32, args.max_concurrency * 2 * len(args.models))
+        )
     )
 
     out_dir = Path(args.output_dir)
@@ -185,9 +189,8 @@ async def main():
     with open(out_dir / "questions.json", "w") as f:
         json.dump(questions, f, indent=2)
 
-    all_records = []
-    for model_name in args.models:
-        print(f"\nGenerating {len(questions)} specialist answers with {model_name} "
+    async def run_model(model_name: str) -> List[Dict]:
+        print(f"Generating {len(questions)} specialist answers with {model_name} "
               f"(up to {args.max_concurrency} concurrent)")
         records = await generate_for_model(
             questions, model_name, args.temperature, args.max_tokens, args.max_concurrency,
@@ -196,7 +199,14 @@ async def main():
         with open(out_path, "w") as f:
             json.dump(records, f, indent=2)
         print(f"Saved {len(records)} responses to {out_path}")
-        all_records.extend(records)
+        return records
+
+    # Run all models CONCURRENTLY. They are distinct providers, so per-provider load
+    # stays at max_concurrency (unchanged vs the old sequential loop) while the providers
+    # overlap instead of running one-after-another -> ~Nx faster for N distinct providers.
+    # gather preserves input order, so all_records stays grouped in --models order.
+    per_model = await asyncio.gather(*(run_model(m) for m in args.models))
+    all_records = [rec for records in per_model for rec in records]
 
     with open(out_dir / "all_pocqi_responses.json", "w") as f:
         json.dump(all_records, f, indent=2)
