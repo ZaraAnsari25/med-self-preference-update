@@ -169,7 +169,11 @@ class PairwiseEvaluator:
             # Ollama detection: for thinking models the OpenAI-compat endpoint ignores
             # think/`/no_think` and returns EMPTY content (reasoning eats the budget).
             # Only native /api/chat with "think": false works. Verified on qwen3.6:35b.
-            self._is_ollama = ("11434" in self.compat_base_url) or (self.compat_api_key.lower() == "ollama")
+            # Port-independent: the sbatch may serve Ollama on a job-specific port, so detect
+            # by loopback host or the dummy "ollama" key rather than the literal 11434.
+            self._is_ollama = (self.compat_api_key.lower() == "ollama") or any(
+                s in self.compat_base_url for s in ("11434", "127.0.0.1", "localhost")
+            )
             native = self.compat_base_url.rstrip("/")
             if native.endswith("/v1"):
                 native = native[:-3]

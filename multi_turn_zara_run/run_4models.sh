@@ -157,6 +157,14 @@ for ((i=0; i<n; i++)); do
         "$PY" src/evaluation/analyze_self_preference_pairwise.py \
           --judge_files "$JA" "$JB" \
           --output "$EVAL_DIR/self_preference_${A}_vs_${B}_${TURNS}t.json" >> "$LOG" 2>&1
+        # Per-model self-preference bias with 95% CI + p (headline metric), per length.
+        "$PY" src/evaluation/spi_significance.py \
+          --judge_files "$JA" "$JB" \
+          --output "$EVAL_DIR/spi_significance_${A}_vs_${B}_${TURNS}t.json" >> "$LOG" 2>&1
+        # Decision-level self-preference: per-judge own/other/tie + binomial test, per length.
+        "$PY" src/evaluation/preference_breakdown.py \
+          --judge_files "$JA" "$JB" \
+          --output "$EVAL_DIR/preference_${A}_vs_${B}_${TURNS}t.json" >> "$LOG" 2>&1
       else
         echo "  (${TURNS}t: skipped SPI: one/both judge files missing)" | tee -a "$LOG"
       fi

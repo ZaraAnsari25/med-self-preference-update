@@ -2,7 +2,7 @@
 # Slurm wrapper for Pipeline 1 (multi-turn) 4-model run on Sherlock.
 #
 # Runs the WHOLE pipeline inside ONE gpu-partition job:
-#   1. starts a local Ollama server (serves the Qwen model on localhost:11434)
+#   1. starts a local Ollama server (serves the Qwen model on a job-specific 127.0.0.1 port)
 #   2. pulls the Qwen model to $SCRATCH
 #   3. activates the venv + loads API keys from .env
 #   4. runs multi_turn_zara_run/run_4models.sh (generate -> truncate -> eval -> SPI)
@@ -42,7 +42,6 @@ export HF_HOME=$SCRATCH/.cache/huggingface
 export XDG_CACHE_HOME=$SCRATCH/.cache
 export PIP_CACHE_DIR=$SCRATCH/.pip-cache
 export OLLAMA_MODELS=$SCRATCH/ollama/models
-export OLLAMA_HOST=127.0.0.1:11434
 mkdir -p "$HF_HOME" "$OLLAMA_MODELS"
 
 # ---- Concurrency ----
@@ -50,7 +49,7 @@ mkdir -p "$HF_HOME" "$OLLAMA_MODELS"
 # Let Ollama serve that many Qwen requests at once (H100-80GB batches this fine) so Qwen
 # isn't the serial bottleneck. OLLAMA_NUM_PARALLEL MUST be exported before `ollama serve`.
 export MAX_CONCURRENCY="${MAX_CONCURRENCY:-12}"
-export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-8}"
+export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-12}"
 
 # ---- Python env ----
 module load python/3.12.1
@@ -60,6 +59,17 @@ export PY=python
 # ---- API keys ----
 set -a; source .env; set +a
 
+# ---- Job-specific Ollama port ----
+# Two Ollama jobs on the SAME node would otherwise both try to bind 11434 and collide.
+# Derive a per-job port, set AFTER sourcing .env so it wins, and point the OpenAI-compat
+# clients at it (this sbatch always serves Ollama locally, so the compat base URL must be
+# this local port).
+OLLAMA_PORT=$(( 11434 + SLURM_JOB_ID % 20000 ))
+export OLLAMA_HOST="127.0.0.1:${OLLAMA_PORT}"
+export OPENAI_COMPAT_BASE_URL="http://127.0.0.1:${OLLAMA_PORT}/v1"
+export OPENAI_COMPAT_API_KEY="ollama"
+echo "Ollama on ${OLLAMA_HOST} (job-specific port)"
+
 # ---- Start Ollama, wait for readiness, pull + alias the Qwen model ----
 module load ollama/0.18.0
 ollama serve > "multi_turn_zara_run/ollama_${SLURM_JOB_ID}.log" 2>&1 &
@@ -68,10 +78,10 @@ trap 'kill $OLLAMA_PID 2>/dev/null || true' EXIT
 
 echo "Waiting for Ollama to come up..."
 for i in $(seq 1 60); do
-  curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+  curl -sf "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 && break
   sleep 2
 done
-curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1 \
+curl -sf "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1 \
   || { echo "ERROR: Ollama did not start"; exit 1; }
 
 echo "Pulling $QWEN_PULL ..."

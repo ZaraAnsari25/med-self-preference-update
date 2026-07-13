@@ -441,7 +441,11 @@ class OpenAICompatibleClient(LLMClient):
         # endpoint IGNORES `think`/`/no_think` and returns EMPTY content (all budget
         # goes to the hidden reasoning channel). Only Ollama's native /api/chat with
         # "think": false actually disables it. Verified empirically on qwen3.6:35b.
-        self._is_ollama = ("11434" in self.base_url) or (self.api_key.lower() == "ollama")
+        # Port-independent: the sbatch may serve Ollama on a job-specific port, so detect
+        # by loopback host or the dummy "ollama" key rather than the literal 11434.
+        self._is_ollama = (self.api_key.lower() == "ollama") or any(
+            s in self.base_url for s in ("11434", "127.0.0.1", "localhost")
+        )
         native = self.base_url.rstrip("/")
         if native.endswith("/v1"):
             native = native[:-3]
